@@ -11,4 +11,5 @@ Pod::Spec.new do |s|
   s.swift_version = '5.0'
   s.source_files = 'Sources/Segment/**/*'
   s.dependency 'Sovran', '~> 1.1.0'
+  s.dependency 'JSONSafeEncoder', '~> 1.1.0'
 end
