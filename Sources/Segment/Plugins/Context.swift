@@ -72,8 +72,14 @@ public class Context: PlatformPlugin {
             app.merge(localizedInfo) { (_, new) in new }
         }
         if app.count != 0 {
+            var name: String = ""
+            if let displayName = app["CFBundleDisplayName"] as? String {
+                name = displayName
+            } else if let displayName = app["CFBundleName"] as? String {
+                name = displayName
+            }
             staticContext["app"] = [
-                "name": app["CFBundleDisplayName"] ?? app["CFBundleName"] ?? "" ,
+                "name": name,
                 "version": app["CFBundleShortVersionString"] ?? "",
                 "build": app["CFBundleVersion"] ?? "",
                 "namespace": Bundle.main.bundleIdentifier ?? ""
@@ -154,4 +160,11 @@ public class Context: PlatformPlugin {
         // other stuff?? ...
     }
 
+    public static func insertOrigin(event: RawEvent?, data: [String: Any]) -> RawEvent? {
+        guard var working = event else { return event }
+        if let newContext = try? working.context?.add(value: data, forKey: "__eventOrigin") {
+            working.context = newContext
+        }
+        return working
+    }
 }

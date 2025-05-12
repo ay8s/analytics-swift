@@ -20,52 +20,53 @@ public class Analytics {
     }
     internal var store: Store
     internal var storage: Storage
-    
+
     /// Enabled/disables debug logging to trace your data going through the SDK.
     public static var debugLogsEnabled = false
-    
+
     public var timeline: Timeline
-    
+
     static internal let deadInstance = "DEADINSTANCE"
     static internal weak var firstInstance: Analytics? = nil
+
     @Atomic static internal var activeWriteKeys = [String]()
-    
+
     /**
      This method isn't a traditional singleton implementation.  It's provided here
      to ease migration from analytics-ios to analytics-swift.  Rather than return a
      singleton, it returns the first instance of Analytics created, OR an instance
      who's writekey is "DEADINSTANCE".
-     
+
      In the case of a dead instance, an assert will be thrown when in DEBUG builds to
      assist developers in knowning that `shared()` is being called too soon.
      */
-    static func shared() -> Analytics {
+    public static func shared() -> Analytics {
         if let a = firstInstance {
             if a.isDead == false {
                 return a
             }
         }
-        
+
         #if DEBUG
         if isUnitTesting == false {
             assert(true == false, "An instance of Analytice does not exist!")
         }
         #endif
-        
+
         return Analytics(configuration: Configuration(writeKey: deadInstance))
     }
-    
+
     /// Initialize this instance of Analytics with a given configuration setup.
     /// - Parameters:
     ///    - configuration: The configuration to use
     public init(configuration: Configuration) {
-        if Self.isActiveWriteKey(configuration.values.writeKey) {
+        /*if Self.isActiveWriteKey(configuration.values.writeKey) {
             // If you're hitting this in testing, it could be a memory leak, or something async is still running
             // and holding a reference.  You can use XCTest.waitUntilFinished(...) to wait for things to complete.
             fatalError("Cannot initialize multiple instances of Analytics with the same write key")
         } else {
             Self.addActiveWriteKey(configuration.values.writeKey)
-        }
+        }*/
         
         store = Store()
         storage = Storage(
@@ -75,40 +76,70 @@ public class Analytics {
             operatingMode: configuration.values.operatingMode
         )
         timeline = Timeline()
-        
+
         // provide our default state
         store.provide(state: System.defaultState(configuration: configuration, from: storage))
-        store.provide(state: UserInfo.defaultState(from: storage))
+        store.provide(state: UserInfo.defaultState(from: storage, anonIdGenerator: configuration.values.anonymousIdGenerator))
         
         storage.analytics = self
-        
+
         checkSharedInstance()
-        
+
         // Get everything running
         platformStartup()
+
+        Telemetry.shared.increment(metric: Telemetry.INVOKE_METRIC) {it in 
+            it["message"] = "configured"
+            it["apihost"] = configuration.values.apiHost
+            it["cdnhost"] = configuration.values.cdnHost
+            it["flush"] =
+                "at:\(configuration.values.flushAt) int:\(configuration.values.flushInterval) pol:\(configuration.values.flushPolicies.count)"
+            it["config"] = "seg:\(configuration.values.autoAddSegmentDestination) ua:\(configuration.values.userAgent ?? "N/A")"
+        }
     }
     
     deinit {
         Self.removeActiveWriteKey(configuration.values.writeKey)
     }
-    
-    internal func process<E: RawEvent>(incomingEvent: E) {
+
+    internal func process<E: RawEvent>(incomingEvent: E, enrichments: [EnrichmentClosure]? = nil) {
         guard enabled == true else { return }
-        let event = incomingEvent.applyRawEventData(store: store)
-        
+        let event = incomingEvent.applyRawEventData(store: store, enrichments: enrichments)
+
         _ = timeline.process(incomingEvent: event)
-        
-        let flushPolicies = configuration.values.flushPolicies
+
+        /*let flushPolicies = configuration.values.flushPolicies
         for policy in flushPolicies {
             policy.updateState(event: event)
-            
+
             if (policy.shouldFlush() == true) {
                 flush()
                 policy.reset()
             }
+        }*/
+        
+        let flushPolicies = configuration.values.flushPolicies
+        
+        var shouldFlush = false
+        // if any policy says to flush, make note of that
+        for policy in flushPolicies {
+            policy.updateState(event: event)
+            if policy.shouldFlush() {
+                shouldFlush = true
+                // we don't need to updateState on any others since we're gonna reset it below.
+                break
+            }
+        }
+        // if we were told to flush do it.
+        if shouldFlush {
+            // reset all the policies if one decided to flush.
+            flushPolicies.forEach {
+                $0.reset()
+            }
+            flush()
         }
     }
-    
+
     /// Process a raw event through the system.  Useful when one needs to queue and replay events at a later time.
     /// - Parameters:
     ///   - event: An event conforming to RawEvent that will be processed.
@@ -160,7 +191,7 @@ extension Analytics {
         }
         return ""
     }
-    
+
     /// Returns the userId that was specified in the last identify call.
     public var userId: String? {
         if let userInfo: UserInfo = store.currentState() {
@@ -168,12 +199,12 @@ extension Analytics {
         }
         return nil
     }
-    
+
     /// Returns the current operating mode this instance was given.
     public var operatingMode: OperatingMode {
         return configuration.values.operatingMode
     }
-    
+
     /// Adjusts the flush interval post configuration.
     public var flushInterval: TimeInterval {
         get {
@@ -186,7 +217,7 @@ extension Analytics {
             }
         }
     }
-    
+
     /// Adjusts the flush-at count post configuration.
     public var flushAt: Int {
         get {
@@ -199,88 +230,55 @@ extension Analytics {
             }
         }
     }
-    
+
     /// Returns a list of currently active flush policies.
     public var flushPolicies: [FlushPolicy] {
         get {
             configuration.values.flushPolicies
         }
     }
-    
+
     /// Returns the traits that were specified in the last identify call.
     public func traits<T: Codable>() -> T? {
         if let userInfo: UserInfo = store.currentState() {
-            return userInfo.traits?.codableValue()
+            return userInfo.traits.codableValue()
         }
         return nil
     }
-    
+
     /// Returns the traits that were specified in the last identify call, as a dictionary.
     public func traits() -> [String: Any]? {
         if let userInfo: UserInfo = store.currentState() {
-            return userInfo.traits?.dictionaryValue
+            return userInfo.traits.dictionaryValue
         }
         return nil
     }
-    
+
     /// Tells this instance of Analytics to flush any queued events up to Segment.com.  This command will also
     /// be sent to each plugin present in the system.  A completion handler can be optionally given and will be
     /// called when flush has completed.
     public func flush(completion: (() -> Void)? = nil) {
         // only flush if we're enabled.
-        guard enabled == true else { return }
+        guard enabled == true else { completion?(); return }
         
-        let flushGroup = DispatchGroup()
-        // gotta call enter at least once before we ask to be notified.
-        flushGroup.enter()
-        
+        let completionGroup = CompletionGroup(queue: configuration.values.flushQueue)
         apply { plugin in
-            // we want to enter as soon as possible.  waiting to do it from
-            // another queue just takes too long.
-            operatingMode.run(queue: configuration.values.flushQueue) {
+            completionGroup.add { group in
                 if let p = plugin as? FlushCompletion {
-                    // flush handles the groups enter/leave calls
-                    p.flush(group: flushGroup) { plugin in
-                        // we don't really care about the plugin value .. yet.
-                    }
+                    p.flush(group: group)
                 } else if let p = plugin as? EventPlugin {
-                    flushGroup.enter()
-                    // we have no idea if this will be async or not, assume it's sync.
+                    group.enter()
                     p.flush()
-                    flushGroup.leave()
+                    group.leave()
                 }
             }
         }
         
-        flushGroup.leave() // matches our initial enter().
-        
-        // if we ARE in sync mode, we need to wait on the group.
-        // This effectively ends up being a `sync` operation.
-        if operatingMode == .synchronous {
-            flushGroup.wait()
-            // we need to call completion on our own since
-            // we skipped setting up notify.  we don't need to do it on
-            // .main since we are in synchronous mode.
-            if let completion { completion() }
-        } else if operatingMode == .asynchronous {
-            // if we're not, flip over to our serial queue, tell it to wait on the flush
-            // group to complete if we have a completion to hit.  Otherwise, no need to
-            // wait on completion.
-            if let completion {
-                // NOTE: DispatchGroup's `notify` method on linux ended up getting called
-                // before the tasks have actually completed, so we went with this instead.
-                OperatingMode.defaultQueue.async { [weak self] in
-                    let timedOut = flushGroup.wait(timeout: .now() + 15 /*seconds*/)
-                    if timedOut == .timedOut {
-                        self?.log(message: "flush(completion:) timed out waiting for completion.")
-                    }
-                    completion()
-                    //DispatchQueue.main.async { completion() }
-                }
-            }
+        completionGroup.run(mode: operatingMode) {
+            completion?()
         }
     }
-    
+
     /// Resets this instance of Analytics to a clean slate.  Traits, UserID's, anonymousId, etc are all cleared or reset.  This
     /// command will also be sent to each plugin present in the system.
     public func reset() {
@@ -291,13 +289,13 @@ extension Analytics {
             }
         }
     }
-    
+
     /// Retrieve the version of this library in use.
     /// - Returns: A string representing the version in "BREAKING.FEATURE.FIX" format.
     public func version() -> String {
         return Analytics.version()
     }
-    
+
     /// Retrieve the version of this library in use.
     /// - Returns: A string representing the version in "BREAKING.FEATURE.FIX" format.
     public static func version() -> String {
@@ -315,7 +313,7 @@ extension Analytics {
         }
         return settings
     }
-    
+
     /// Manually enable a destination plugin.  This is useful when a given DestinationPlugin doesn't have any Segment tie-ins at all.
     /// This will allow the destination to be processed in the same way within this library.
     /// - Parameters:
@@ -339,17 +337,17 @@ extension Analytics {
 
         return storage.dataStore.hasData
     }
-    
+
     /// Provides a list of finished, but unsent events.
     public var pendingUploads: [URL]? {
         return storage.read(Storage.Constants.events)?.dataFiles
     }
-    
+
     /// Purge all pending event upload files.
     public func purgeStorage() {
         storage.dataStore.reset()
     }
-    
+
     /// Purge a single event upload file.
     public func purgeStorage(fileURL: URL) {
         guard let dataFiles = storage.read(Storage.Constants.events)?.dataFiles else { return }
@@ -357,7 +355,7 @@ extension Analytics {
             try? FileManager.default.removeItem(at: fileURL)
         }
     }
-    
+
     /// Wait until the Analytics object has completed startup.
     /// This method is primarily useful for command line utilities where
     /// it's desirable to wait until the system is up and running
@@ -377,7 +375,7 @@ extension Analytics {
      Call openURL as needed or when instructed to by either UIApplicationDelegate or UISceneDelegate.
      This is necessary to track URL referrers across events.  This method will also iterate
      any plugins that are watching for openURL events.
-     
+
      Example:
      ```
      func application(_ app: UIApplication, open url: URL, options: [UIApplication.OpenURLOptionsKey : Any] = [:]) -> Bool {
@@ -392,12 +390,12 @@ extension Analytics {
         guard let dict = jsonProperties.dictionaryValue else { return }
         openURL(url, options: dict)
     }
-    
+
     /**
      Call openURL as needed or when instructed to by either UIApplicationDelegate or UISceneDelegate.
      This is necessary to track URL referrers across events.  This method will also iterate
      any plugins that are watching for openURL events.
-     
+
      Example:
      ```
      func application(_ app: UIApplication, open url: URL, options: [UIApplication.OpenURLOptionsKey : Any] = [:]) -> Bool {
@@ -408,18 +406,21 @@ extension Analytics {
      */
     public func openURL(_ url: URL, options: [String: Any] = [:]) {
         store.dispatch(action: UserInfo.SetReferrerAction(url: url))
-        
+
         // let any conforming plugins know
         apply { plugin in
             if let p = plugin as? OpeningURLs {
                 p.openURL(url, options: options)
             }
         }
-        
+
         var jsonProperties: JSON? = nil
         if let json = try? JSON(options) {
-            jsonProperties = json
-            _ = try? jsonProperties?.add(value: url.absoluteString, forKey: "url")
+            do {
+                jsonProperties = try json.add(value: url.absoluteString, forKey: "url")
+            } catch {
+                jsonProperties = json
+            }
         } else {
             if let json = try? JSON(["url": url.absoluteString]) {
                 jsonProperties = json
@@ -444,7 +445,7 @@ extension Analytics {
             Self.firstInstance = self
         }
     }
-    
+
     /// Determines if an instance is dead.
     internal var isDead: Bool {
         return configuration.values.writeKey == Self.deadInstance
@@ -456,12 +457,16 @@ extension Analytics {
     }
     
     internal static func addActiveWriteKey(_ writeKey: String) {
-        Self.activeWriteKeys.append(writeKey)
+        Self._activeWriteKeys.mutate { keys in
+            keys.append(writeKey)
+        }
     }
     
     internal static func removeActiveWriteKey(_ writeKey: String) {
-        Self.activeWriteKeys.removeAll { key in
-            writeKey == key
+        Self._activeWriteKeys.mutate { keys in
+            keys.removeAll { key in
+                writeKey == key
+            }
         }
     }
 }
@@ -484,4 +489,3 @@ extension OperatingMode {
         }
     }
 }
-

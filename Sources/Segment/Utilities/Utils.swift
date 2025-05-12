@@ -7,7 +7,7 @@
 
 import Foundation
 
-#if os(Linux)
+#if os(Linux) || os(Windows)
 extension DispatchQueue {
     func asyncAndWait(execute workItem: DispatchWorkItem) {
         async {
@@ -15,6 +15,11 @@ extension DispatchQueue {
         }
         workItem.wait()
     }
+}
+
+// Linux doesn't have autoreleasepool.
+func autoreleasepool(closure: () -> Void) {
+    closure()
 }
 #endif
 
